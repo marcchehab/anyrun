@@ -3,7 +3,7 @@ use anyrun_plugin::{anyrun_interface::HandleResult, *};
 use fuzzy_matcher::FuzzyMatcher;
 use scrubber::DesktopEntry;
 use serde::Deserialize;
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{collections::HashMap, env, fs, path::PathBuf, process::Command};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -36,6 +36,34 @@ impl Default for Config {
 pub struct State {
     config: Config,
     entries: Vec<(DesktopEntry, u64)>,
+    history: HashMap<String, u64>,
+}
+
+// Launch counts keyed by the entry's Exec line, persisted across sessions.
+fn history_path() -> PathBuf {
+    let cache = env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| format!("{}/.cache", env::var("HOME").expect("no HOME")));
+    PathBuf::from(cache).join("anyrun-app-launches.ron")
+}
+
+fn load_history() -> HashMap<String, u64> {
+    fs::read_to_string(history_path())
+        .ok()
+        .and_then(|content| ron::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn record_launch(exec: &str) {
+    let mut history = load_history();
+    *history.entry(exec.to_string()).or_insert(0) += 1;
+    match ron::to_string(&history) {
+        Ok(content) => {
+            if let Err(why) = fs::write(history_path(), content) {
+                eprintln!("[applications] Error writing launch history: {}", why);
+            }
+        }
+        Err(why) => eprintln!("[applications] Error serializing launch history: {}", why),
+    }
 }
 
 mod scrubber;
@@ -53,6 +81,8 @@ pub fn handler(selection: Match, state: &State) -> HandleResult {
             }
         })
         .unwrap();
+
+    record_launch(&entry.exec);
 
     let exec = if let Some(script) = &state.config.preprocess_exec_script {
         let output = Command::new("sh")
@@ -180,7 +210,11 @@ pub fn init(config_dir: RString) -> State {
         Vec::new()
     });
 
-    State { config, entries }
+    State {
+        config,
+        entries,
+        history: load_history(),
+    }
 }
 
 #[get_matches]
@@ -213,6 +247,10 @@ pub fn get_matches(input: RString, state: &State) -> RVec<Match> {
             if entry.is_action {
                 score *= 2;
             }
+
+            // frecency: multiplicative boost from launch count, capped at 10x
+            let launches = state.history.get(&entry.exec).copied().unwrap_or(0);
+            score = score * (10 + 3 * launches.min(30) as i64) / 10;
 
             // Score cutoff
             if score > 0 {
