@@ -141,14 +141,23 @@ pub fn get_matches(input: RString, state: &State) -> RVec<Match> {
         }
         None => {
             let matcher = fuzzy_matcher::skim::SkimMatcherV2::default().smart_case();
+            // Every whitespace separated token must match somewhere in the path, so
+            // `plan pdf` finds `holidayplan_v1.pdf`. Scores are summed.
+            let tokens = input.split_whitespace().collect::<Vec<_>>();
+            if tokens.is_empty() {
+                return RVec::new();
+            }
             let mut index = state
                 .index
                 .clone()
                 .into_iter()
                 .filter_map(|(id, index_entry)| {
-                    matcher
-                        .fuzzy_match(&index_entry.path.as_os_str().to_string_lossy(), &input)
-                        .map(|val| (index_entry, id, val))
+                    let path = index_entry.path.as_os_str().to_string_lossy();
+                    let mut score = 0;
+                    for token in &tokens {
+                        score += matcher.fuzzy_match(&path, token)?;
+                    }
+                    Some((index_entry, id, score))
                 })
                 .collect::<Vec<_>>();
 
