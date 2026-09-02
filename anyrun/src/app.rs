@@ -1,7 +1,7 @@
 use crate::{
     config::{self, Action, Config, Keybind},
     plugin_box::{PluginBox, PluginBoxInput, PluginBoxOutput, PluginMatch},
-    provider, Args,
+    provider, Args, DaemonState,
 };
 use anyrun_interface::HandleResult;
 use anyrun_provider_ipc as ipc;
@@ -11,9 +11,11 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use relm4::{prelude::*, ComponentBuilder, Sender};
 use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 use tokio::sync::mpsc;
@@ -24,6 +26,11 @@ const DEFAULT_CSS: &str = include_str!("../res/style.css");
 pub enum PostRunAction {
     Stdout(Vec<u8>),
     None,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub enum ShowError {
+    AlreadyShowed,
 }
 
 #[derive(Debug)]
@@ -50,7 +57,7 @@ pub struct AppInit {
 
 pub struct App {
     config: Arc<Config>,
-    invocation: Option<gio::DBusMethodInvocation>,
+    daemon_ctx: Option<(Rc<RefCell<DaemonState>>, gio::DBusMethodInvocation)>,
     plugins: FactoryVecDeque<PluginBox>,
     post_run_action: PostRunAction,
     tx: mpsc::Sender<anyrun_provider_ipc::Request>,
@@ -61,11 +68,11 @@ impl App {
     pub fn launch(
         app: &gtk::Application,
         app_init: AppInit,
-        invocation: Option<gio::DBusMethodInvocation>,
+        daemon_ctx: Option<(Rc<RefCell<DaemonState>>, gio::DBusMethodInvocation)>,
     ) -> Sender<AppMsg> {
         let builder = ComponentBuilder::<App>::default();
 
-        let connector = builder.launch((app_init, invocation));
+        let connector = builder.launch((app_init, daemon_ctx));
 
         let mut controller = connector.detach();
         let window = controller.widget();
@@ -122,7 +129,10 @@ impl App {
 impl Component for App {
     type Input = AppMsg;
     type Output = ();
-    type Init = (AppInit, Option<gio::DBusMethodInvocation>);
+    type Init = (
+        AppInit,
+        Option<(Rc<RefCell<DaemonState>>, gio::DBusMethodInvocation)>,
+    );
     type CommandOutput = anyrun_provider_ipc::Response;
 
     view! {
@@ -206,7 +216,7 @@ impl Component for App {
     }
 
     fn init(
-        (app_init, invocation): Self::Init,
+        (app_init, daemon_ctx): Self::Init,
         root: Self::Root,
         sender: relm4::ComponentSender<Self>,
     ) -> relm4::ComponentParts<Self> {
@@ -234,15 +244,13 @@ impl Component for App {
         let css_provider = gtk::CssProvider::new();
 
         let mut config = if let Some(config_dir) = &config_dir {
-            match fs::read_to_string(format!("{config_dir}/style.css")) {
-                Ok(style) => {
-                    css_provider.load_from_string(&style);
-                }
-                Err(why) => {
-                    eprintln!("[anyrun] Failed to load CSS: {why}");
-                    css_provider.load_from_string(DEFAULT_CSS);
-                }
-            }
+            let css_path = Path::new(&config_dir).join("style.css");
+            if css_path.exists() {
+                css_provider.load_from_path(css_path);
+            } else {
+                eprintln!("[anyrun] {config_dir}/style.css does not exist");
+                css_provider.load_from_string(DEFAULT_CSS);
+            };
             match fs::read(format!("{config_dir}/config.ron")) {
                 Ok(content) => ron::de::from_bytes(&content).unwrap_or_else(|why| {
                     eprintln!("[anyrun] Failed to parse config file, using default values: {why}");
@@ -295,7 +303,7 @@ impl Component for App {
 
         let widgets = view_output!();
         let model = Self {
-            invocation,
+            daemon_ctx,
             config,
             plugins: plugins_factory,
             post_run_action: PostRunAction::None,
@@ -367,10 +375,15 @@ impl Component for App {
             }
             AppMsg::Action(action) => match action {
                 Action::Close => {
-                    if let Some(invocation) = self.invocation.clone() {
+                    if let Some((daemon_state, invocation)) = self.daemon_ctx.clone() {
                         invocation.return_value(Some(
-                            &(serde_json::to_vec(&self.post_run_action).unwrap(),).to_variant(),
+                            &(
+                                serde_json::to_vec(&Ok::<_, ShowError>(&self.post_run_action))
+                                    .unwrap(),
+                            )
+                                .to_variant(),
                         ));
+                        daemon_state.borrow_mut().sender = None;
                     } else {
                         match &self.post_run_action {
                             PostRunAction::Stdout(bytes) => {

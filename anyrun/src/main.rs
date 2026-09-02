@@ -10,6 +10,7 @@ use gtk4::{
     self as gtk,
     gio::{self},
 };
+use gtk4_layer_shell::LayerShell;
 use relm4::Sender;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,9 @@ const INTERFACE_XML: &str = r#"
             <arg type="ay" name="args" direction="in"/>
             <arg type="ay" name="result" direction="out"/>
         </method>
-        <method name="Close"></method>
+        <method name="Close">
+            <arg type="ay" name="result" direction="out"/>
+        </method>
         <method name="Quit"></method>
     </interface>
 </node> 
@@ -38,6 +41,11 @@ const INTERFACE_XML: &str = r#"
 #[derive(Debug, glib::Variant)]
 struct Show {
     args: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub enum CloseError {
+    NotShowed,
 }
 
 enum InterfaceMethod {
@@ -90,7 +98,7 @@ enum Command {
 }
 
 /// Refcelled state for the daemon DBus listener
-struct DaemonState {
+pub struct DaemonState {
     sender: Option<Sender<app::AppMsg>>,
 }
 
@@ -149,11 +157,18 @@ fn main() {
 
                 let (bytes,): (Vec<u8>,) = FromVariant::from_variant(&res).unwrap();
 
-                match serde_json::from_slice::<app::PostRunAction>(&bytes).unwrap() {
-                    app::PostRunAction::Stdout(stdout) => {
+                let res =
+                    serde_json::from_slice::<Result<app::PostRunAction, app::ShowError>>(&bytes)
+                        .unwrap();
+                match res {
+                    Ok(app::PostRunAction::Stdout(stdout)) => {
                         io::stdout().lock().write_all(&stdout).unwrap()
                     }
-                    app::PostRunAction::None => (),
+                    Ok(app::PostRunAction::None) => (),
+                    Err(app::ShowError::AlreadyShowed) => {
+                        eprintln!("[anyrun] Anyrun is already visible.");
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 eprintln!("\x1B[1;33m[anyrun] Warning: started in standalone mode, clipboard functionality will be unavailable and startup speed is reduced. \
@@ -179,7 +194,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            proxy
+            let res = proxy
                 .call_sync(
                     "Close",
                     None,
@@ -188,6 +203,17 @@ fn main() {
                     Option::<&gio::Cancellable>::None,
                 )
                 .unwrap();
+
+            let (bytes,): (Vec<u8>,) = FromVariant::from_variant(&res).unwrap();
+            let res = serde_json::from_slice(&bytes).unwrap();
+            match res {
+                Ok(()) => {}
+                Err(CloseError::NotShowed) => {
+                    eprintln!("[anyrun] Anyrun isn't currently visible");
+                    std::process::exit(1);
+                }
+            }
+
             app.run_with_args(&Vec::<String>::new());
         }
         Some(Command::Quit) => {
@@ -212,6 +238,13 @@ fn main() {
 
             let state = Rc::new(RefCell::new(DaemonState { sender: None }));
 
+            // Create an empty window on launch and show it to make sure GPU resources are initialized
+            // This should help with first launch speed
+            let window = gtk::Window::new();
+            window.init_layer_shell();
+            window.set_visible(true);
+            window.close();
+
             dbus_conn
                 .register_object("/org/anyrun/anyrun", &interface)
                 .typed_method_call::<InterfaceMethod>()
@@ -224,18 +257,39 @@ fn main() {
                         let app = app.unwrap();
                         match method {
                             InterfaceMethod::Show(show) => {
-                                state.borrow_mut().sender = Some(app::App::launch(
-                                    &app,
-                                    serde_json::from_slice(&show.args).unwrap(),
-                                    Some(invocation),
-                                ));
+                                // Only launch an instance if another one doesn't exist
+                                if state.borrow().sender.is_none() {
+                                    state.borrow_mut().sender = Some(app::App::launch(
+                                        &app,
+                                        serde_json::from_slice(&show.args).unwrap(),
+                                        Some((state.clone(), invocation)),
+                                    ));
+                                } else {
+                                    invocation.return_value(Some(
+                                        &(serde_json::to_vec(&Err::<app::PostRunAction, _>(
+                                            app::ShowError::AlreadyShowed,
+                                        ))
+                                        .unwrap(),)
+                                            .to_variant(),
+                                    ));
+                                }
                             }
                             InterfaceMethod::Close => {
-                                if let Some(sender) = &state.borrow().sender {
+                                // If launcher is open, return an ok value. If launcher is closed, return an err to
+                                // facilitate a non zero exit code
+                                if let Some(sender) = state.borrow().sender.clone() {
                                     sender.emit(app::AppMsg::Action(config::Action::Close));
+                                    invocation.return_value(Some(
+                                        &(serde_json::to_vec(&Ok::<(), CloseError>(())).unwrap(),)
+                                            .to_variant(),
+                                    ));
+                                } else {
+                                    invocation.return_value(Some(
+                                        &(serde_json::to_vec(&Err::<(), _>(CloseError::NotShowed))
+                                            .unwrap(),)
+                                            .to_variant(),
+                                    ))
                                 }
-                                state.borrow_mut().sender = None;
-                                invocation.return_value(None);
                             }
                             InterfaceMethod::Quit => {
                                 invocation.return_value(None);

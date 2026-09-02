@@ -124,7 +124,7 @@ in
         provider = mkOption {
           type = nullOr package;
           default = defaultProvider;
-          defaultText = literalExpression "anyrun.packages.${pkgs.stdenv.hostPlatform.sytstem}.default.passthru.anyrun-provider";
+          defaultText = literalExpression "anyrun.packages.${pkgs.stdenv.hostPlatform.system}.default.passthru.anyrun-provider";
           description = ''
             The program that is used for loading the plugins, and for the communcation with them.
           '';
@@ -158,7 +158,7 @@ in
         };
 
         height = mkNumericOption {
-          default.absolute = 0;
+          default.absolute = 1;
           description = ''
             The minimum height of the runner, the runner will expand to fit all the entries.
 
@@ -231,6 +231,10 @@ in
                   default = false;
                 };
                 alt = mkOption {
+                  type = bool;
+                  default = false;
+                };
+                shift = mkOption {
                   type = bool;
                   default = false;
                 };
@@ -346,6 +350,7 @@ in
                   Keybind(
                     ${optionalString x.ctrl "ctrl: true,"}
                     ${optionalString x.alt "alt: true,"}
+                    ${optionalString x.shift "shift: true,"}
                     key: "${x.key}",
                     action: ${capitalize x.action},
                   ),
