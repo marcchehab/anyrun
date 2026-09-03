@@ -1,0 +1,42 @@
+# Local package: anyrun from marcchehab/anyrun branch "patched"
+# (frecency ranking + kidex multi-token search), layout mirrors the
+# CachyOS repo "anyrun" package.
+_providerver=25.12.0
+pkgname=anyrun-patched
+pkgver=26.6.1.r4.5184c5d
+pkgrel=1
+pkgdesc="Anyrun with frecency ranking and kidex multi-token search (marcchehab/anyrun patched branch)"
+arch=(x86_64)
+url="https://github.com/marcchehab/anyrun"
+license=(GPL3)
+depends=(gtk4-layer-shell)
+makedepends=(git cargo)
+provides=(anyrun)
+conflicts=(anyrun anyrun-git anyrun-provider)
+backup=(etc/xdg/anyrun/config.ron etc/xdg/anyrun/style.css)
+options=(!lto)
+source=("anyrun::git+https://github.com/marcchehab/anyrun.git#branch=patched"
+        "anyrun-provider-${_providerver}.tar.gz::https://github.com/anyrun-org/anyrun-provider/archive/refs/tags/v${_providerver}.tar.gz")
+sha256sums=('SKIP' 'SKIP')
+
+pkgver() {
+  cd anyrun
+  printf "26.6.1.r%s.%s" "$(git rev-list --count v26.6.1..HEAD 2>/dev/null || echo 0)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable
+  cd "$srcdir/anyrun"
+  cargo build --release --locked
+  cd "$srcdir/anyrun-provider-${_providerver}"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/anyrun"
+  install -Dm0755 -t "$pkgdir/usr/bin/" target/release/anyrun
+  install -Dm0755 -t "$pkgdir/usr/bin/" "$srcdir/anyrun-provider-${_providerver}/target/release/anyrun-provider"
+  install -Dm0644 -t "$pkgdir/usr/lib/anyrun/" target/release/*.so
+  install -Dm0644 examples/config.ron "$pkgdir/etc/xdg/anyrun/config.ron"
+  install -Dm0644 anyrun/res/style.css "$pkgdir/etc/xdg/anyrun/style.css"
+}
